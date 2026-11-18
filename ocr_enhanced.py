@@ -1,26 +1,25 @@
 """Server-side reading enhancements for the PDF Text Reader API.
 
 Wraps ocr_core.read_page() — the proven desktop pipeline, used
-unchanged — with two keep-best retries that only run on weak pages:
+unchanged — with a keep-best rotation retry that only runs on weak
+pages (mean OCR confidence below 70; a sideways page reads ~1/54
+words). The existing deskew only fixes small tilts; this is for full
+90-degree rotations. All five non-identity orientations are tried —
+the three rotations plus the two diagonal flips (transpose,
+transverse): a raster can arrive mirrored as well as rotated (the
+sideways test file is a transpose, not a pure rotation), and a
+pure-rotation retry misses that.
 
-  1. Otsu standalone variant: the Otsu-binarized 2x-upscale image run
-     as its OWN candidate. The desktop pipeline already has this rescue
-     inside ocr_page_image(), merged into the standard result; here it
-     is also tried standalone, and whichever result (standard or Otsu)
-     has the better mean OCR confidence wins. Pages that already read
-     well never see it.
-  2. Auto-rotate retry: when a page's mean OCR confidence is below 70
-     (a sideways page reads ~1/54 words), re-run OCR on the other
-     orientations of the rendered page and keep the best by mean OCR
-     confidence. The existing deskew only fixes small tilts; this is
-     for full 90-degree rotations. All five non-identity orientations
-     are tried — the three rotations plus the two diagonal flips
-     (transpose, transverse): a raster can arrive mirrored as well as
-     rotated (the sideways test file is a transpose, not a pure
-     rotation), and a pure-rotation retry misses that. The loop stops
-     early once a candidate reads genuinely well (mean >= 85), so a
-     normal upside-down or sideways page pays for one or two extra
-     passes, not five.
+Speed trim (Nov 18, 2026 — the Render free host is 0.1 CPU, and the
+old full-pass-per-orientation retry pushed weak pages past the web
+app's timeout into the local fallback): orientations are ranked with
+LIGHT probes first — one PSM pass over a 150-DPI downscale, confidence
+only, no boxes — and only the best probe orientation gets one full
+pipeline pass. The probe loop stops early once a probe reads genuinely
+well (mean >= 85). There is no standalone Otsu candidate any more:
+the standard pipeline already merges the Otsu rescue when a page is
+weak, and the standalone pass cost two full-res runs per weak page
+for marginal gains.
 
 "Best" means highest mean confidence over OCR words (native-layer
 words are conf 100 and identical across candidates, so they are left
@@ -43,15 +42,10 @@ from PIL import Image
 
 from ocr_core import (
     PRESETS,
-    _DESKEW_MIN_ANGLE,
     _drop_same_text_duplicates,
-    _estimate_skew_angle,
-    _fix_engineering_symbols,
     _merge_word_lists,
-    _ocr_passes,
-    _otsu_binarize,
     _result_is_weak,
-    _whiten_dark_edges,
+    _tess_config,
     native_words,
     ocr_page_image,
     page_rect_to_display_rect,
@@ -97,30 +91,6 @@ def _finish(native, ocr_words):
     return merged, "mixed" if added else "native"
 
 
-def _otsu_candidate(img, scale, doc, page_index, preset_name):
-    """The Otsu-binarized 2x-upscale image as a standalone candidate.
-    Same preprocessing and rescue branch ocr_page_image() uses
-    (deskew, dark-edge whitening, Otsu, LANCZOS 2x), run on its own
-    instead of merged into the standard result."""
-    preset = PRESETS[preset_name]
-    page = doc[page_index]
-    gray = img.convert("L") if img.mode != "L" else img
-    deskew_angle = 0.0
-    angle = _estimate_skew_angle(gray)
-    if abs(angle) >= _DESKEW_MIN_ANGLE:
-        deskew_angle = angle
-        gray = gray.rotate(angle, resample=Image.BICUBIC, fillcolor=255)
-    gray = _whiten_dark_edges(gray, scale)
-    rescue = _otsu_binarize(gray)
-    rescue = rescue.resize((rescue.width * 2, rescue.height * 2),
-                           Image.LANCZOS)
-    words = _ocr_passes(rescue, preset, scale * 2, page,
-                        deskew_angle=deskew_angle)
-    if preset_name == "engineering":
-        _fix_engineering_symbols(words)
-    return _finish(native_words(doc, page_index), words)
-
-
 # Mean OCR confidence at or above this means a candidate reads
 # genuinely well; the orientation loop stops early once reached.
 GOOD_ENOUGH_MEAN_CONF = 85.0
@@ -162,6 +132,67 @@ _ORIENTATIONS = [
 ]
 
 
+# Light rotation probes run at this DPI: telling orientations apart
+# does not need 375 DPI, and a probe is one PSM pass over roughly a
+# sixth of the pixels.
+PROBE_DPI = 150
+
+
+def _probe_mean(img, preset):
+    """Mean OCR confidence of one quick PSM pass over a small
+    grayscale image. Boxes are not needed — the probe only ranks
+    orientations — so this returns (mean_conf, word_count), with
+    mean_conf None when the pass found no usable words."""
+    import pytesseract
+
+    gray = img.convert("L") if img.mode != "L" else img
+    data = pytesseract.image_to_data(
+        gray, config=_tess_config(preset, preset["psm"]),
+        output_type=pytesseract.Output.DICT,
+    )
+    confs = []
+    n = len(data["text"])
+    for i in range(n):
+        if not (data["text"][i] or "").strip():
+            continue
+        try:
+            conf = float(data["conf"][i])
+        except (TypeError, ValueError):
+            continue
+        if conf < 0:
+            continue
+        confs.append(conf)
+    if not confs:
+        return None, 0
+    return sum(confs) / len(confs), len(confs)
+
+
+def _probe_orientations(img, scale, preset_name):
+    """Rank the five non-identity orientations with light probes.
+    Returns [{variant, mean_conf, words, ms}] in the order tried,
+    stopping early once a probe reads genuinely well (>= 85).
+    scale is px per point of the full-res render."""
+    preset = PRESETS[preset_name]
+    factor = (PROBE_DPI / 72.0) / scale
+    out = []
+    for variant_name, transpose_op in _ORIENTATIONS:
+        t1 = time.monotonic()
+        oriented = img.transpose(transpose_op)
+        small = oriented.resize(
+            (max(1, round(oriented.width * factor)),
+             max(1, round(oriented.height * factor))),
+            Image.LANCZOS)
+        mean, words = _probe_mean(small, preset)
+        out.append({"variant": "probe:" + variant_name,
+                    "mean_conf": round(mean, 1)
+                    if mean is not None else None,
+                    "words": words,
+                    "ms": round((time.monotonic() - t1) * 1000)})
+        if mean is not None and mean >= GOOD_ENOUGH_MEAN_CONF:
+            break
+    return out
+
+
 def _oriented_candidate(img, scale, doc, page_index, preset_name,
                         orientation, transpose_op):
     """OCR a re-oriented copy of the rendered page and map every word
@@ -186,12 +217,12 @@ def _oriented_candidate(img, scale, doc, page_index, preset_name,
 
 
 def read_page_enhanced(doc, page_index, preset_name):
-    """Read one page with the standard pipeline plus keep-best retries
-    on weak pages only. Returns read_page()'s dict plus:
-      variant:    'standard' | 'otsu' | 'rot90' | 'rot180' | 'rot270'
+    """Read one page with the standard pipeline plus a keep-best
+    rotation retry on weak pages only. Returns read_page()'s dict plus:
+      variant:    'standard' | 'rot90' | 'rot180' | 'rot270'
                   | 'transpose' | 'transverse' — which candidate won.
       candidates: [{variant, mean_conf, words, ms}] for every candidate
-                  tried, in the order tried.
+                  tried, in the order tried (probes are 'probe:<name>').
       ms:         total milliseconds spent on the page.
     Clean pages cost exactly one read_page() call."""
     t0 = time.monotonic()
@@ -206,35 +237,30 @@ def read_page_enhanced(doc, page_index, preset_name):
                    "ms": round((time.monotonic() - t0) * 1000)}]
 
     if _result_is_weak(base["words"]):
-        # One render shared by every extra candidate below.
+        # One render shared by the probes below.
         img, scale = render_page_image(
             doc, page_index, PRESETS[preset_name]["dpi"])
         img.info["px_per_point"] = scale
 
-        # Candidate 2: Otsu standalone. Only replaces the standard
-        # result when its mean OCR confidence is strictly better.
-        t1 = time.monotonic()
-        otsu_words, otsu_source = _otsu_candidate(
-            img, scale, doc, page_index, preset_name)
-        otsu_mean = _ocr_mean_conf(otsu_words)
-        candidates.append({"variant": "otsu",
-                           "mean_conf": round(otsu_mean, 1)
-                           if otsu_mean is not None else None,
-                           "words": len(otsu_words),
-                           "ms": round((time.monotonic() - t1) * 1000)})
-        if (otsu_mean is not None and best_mean is not None
-                and otsu_mean > best_mean + MIN_IMPROVEMENT):
-            best_words, best_source = otsu_words, otsu_source
-            best_mean, variant = otsu_mean, "otsu"
-
-        # Candidates 3+: other orientations, only while the best so
-        # far is still weak (mean OCR confidence below 70). A page
-        # the Otsu variant already fixed does not pay for more passes.
-        # The loop also stops early once a candidate reads genuinely
-        # well (mean >= 85) — a later orientation cannot beat a good
-        # read by enough to be worth another full pass.
+        # Rotation retry, only while the page still reads weakly
+        # (mean OCR confidence below 70). Light probes rank the five
+        # orientations cheaply; only the best probe orientation gets
+        # one full pipeline pass, and it replaces the standard result
+        # only when its mean beats it by more than MIN_IMPROVEMENT.
         if best_mean is not None and best_mean < ROTATE_MEAN_CONF:
-            for variant_name, transpose_op in _ORIENTATIONS:
+            probes = _probe_orientations(img, scale, preset_name)
+            candidates.extend(probes)
+            best_probe = None
+            for p in probes:
+                if p["mean_conf"] is None:
+                    continue
+                if (best_probe is None
+                        or p["mean_conf"] > best_probe["mean_conf"]):
+                    best_probe = p
+            if (best_probe is not None
+                    and best_probe["mean_conf"] > best_mean + MIN_IMPROVEMENT):
+                variant_name = best_probe["variant"][len("probe:"):]
+                transpose_op = dict(_ORIENTATIONS)[variant_name]
                 t1 = time.monotonic()
                 ori_words, ori_source = _oriented_candidate(
                     img, scale, doc, page_index, preset_name,
@@ -246,12 +272,10 @@ def read_page_enhanced(doc, page_index, preset_name):
                      if ori_mean is not None else None,
                      "words": len(ori_words),
                      "ms": round((time.monotonic() - t1) * 1000)})
-                if (ori_mean is not None and best_mean is not None
+                if (ori_mean is not None
                         and ori_mean > best_mean + MIN_IMPROVEMENT):
                     best_words, best_source = ori_words, ori_source
                     best_mean, variant = ori_mean, variant_name
-                if best_mean is not None and best_mean >= GOOD_ENOUGH_MEAN_CONF:
-                    break
 
     return {"words": best_words, "source": best_source,
             "page": base["page"], "variant": variant,
