@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: pdf-text-reader-api
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: OMP_THREAD_LIMIT
+        value: "1"
